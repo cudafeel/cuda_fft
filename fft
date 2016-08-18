@@ -1,0 +1,198 @@
+/*******************************************************
+分析
+1、同一级相同旋转因子的蝶形运算可以并行
+2、首先计算出旋转因子，纹理内存采用查表方式
+3、后一级蝶形运算用到的是上一级的偶数序列的旋转因子
+2016 7.11
+*******************************************************/
+#include "C:\Users\Administrator\Desktop\common\book.h"
+#include "cuda.h"
+#include "math.h"
+#include "stdio.h"
+#include "cuda_profiler_api.h"
+
+#define pi 3.1415926535897932384626433832795028841971
+#define N  32768 //做个1024点的FFT
+
+texture<float> W_r;
+texture<float> W_i;
+/*
+//定义一个通用结构体来保存复数值，并且定义复数的加法运算符和乘法运算符
+struct cuComplex{
+
+	float r;
+    float i;
+
+	__device__ cuComplex( float a, float b) : r(a), i(b) {}
+	__device__ cuComplex operator*( cuComplex &a) {
+		return cuComplex(r*a.r - i*a.i, i*a.r + r*a.i);//复数乘
+	}
+	__device__ cuComplex operator+( cuComplex &a) {
+		return cuComplex(r+a.r, i+a.i);//复数加
+	}
+		__device__ cuComplex operator-( cuComplex &a) {
+		return cuComplex(r-a.r, i-a.i);//复数减
+	}
+};
+__device__ cuComplex *input;   */
+__global__ void kernel(  float *dev_r, float *dev_i, int le,int lei, int j, int m ) {
+	
+	    int tid_block = ( threadIdx.x + blockIdx.x * blockDim.x ) * le;
+	     float sdata_r, sdata_i,sdata_r_m,sdata_i_m;
+	    float t_r,t_i;
+	    float u_r, float u_i;
+	     //相同旋转因子的蝶形运算并行计算
+		u_r = tex1Dfetch(W_r,N/le*j);//系数回去看书具体怎么写
+		u_i = tex1Dfetch(W_i,N/le*j);//查表得到旋转因子的值
+
+		int ip = j+tid_block+lei;
+		int i = tid_block+j;
+		t_i = dev_i[ip] * u_r + dev_r[ip] * u_i;//乘上系数
+		t_r = dev_r[ip] * u_r - dev_i[ip] * u_i;
+
+		
+		sdata_r_m = dev_r[i] - t_r;
+		sdata_i_m = dev_i[i] - t_i;
+		sdata_r = dev_r[i] + t_r;
+		sdata_i = dev_i[i] + t_i;
+				 	  
+		__syncthreads();
+		dev_r[ip] = sdata_r_m; 
+		dev_i[ip] = sdata_i_m;
+		dev_r[i] = sdata_r;//把值放回原存储单元，进行下一级的计算
+		dev_i[i] = sdata_i;
+		__syncthreads();        
+		
+	
+		 
+ }
+
+__global__ void Wn_kernel( float *Wn_r, float *Wn_i ) {
+
+	int tid_block = threadIdx.x+blockIdx.x*blockDim.x;
+    Wn_r[tid_block] = cos(pi*2*tid_block/N);
+	Wn_i[tid_block] = -( sin(pi*2*tid_block/N) );
+}
+
+void reverse( float *in) {
+
+   int nv2,nm1,i,k,j=0;
+   float t;
+   nv2=N/2;        //变址运算，即把自然顺序变成倒位序，采用雷德算法
+   nm1=N-1;  
+   for(i=0;i<nm1;i++)        
+   {
+    if(i<j)                    //如果i<j,即进行变址
+     {
+      t=in[j];           
+      in[j]=in[i];
+      in[i]=t;
+     }
+    k=nv2;                    //求j的下一个倒位序
+    while(k<=j)               //如果k<=j,表示j的最高位为1   
+     {           
+      j=j-k;                 //把最高位变成0
+      k=k/2;                 //k/2，比较次高位，依次类推，逐个比较，直到某个位为0
+     }
+   j=j+k;                   //把0改为1
+  }
+}
+
+
+
+int main( void ) {
+
+	float *r, *i;
+	float *out_r, *out_i;
+	float *dev_r, *dev_i;
+	cudaProfilerStart();
+	r = (float*)malloc(sizeof(float)*N);
+	i = (float*)malloc(sizeof(float)*N);
+
+	out_r = (float*)malloc(sizeof(float)*N);
+	out_i = (float*)malloc(sizeof(float)*N);
+
+	 for(int n=0; n<N; n++) {
+
+		r[n] = n+1;
+		i[n] = 0;
+		
+	}
+	cudaEvent_t start, stop;
+	HANDLE_ERROR( cudaEventCreate(&start) );
+	HANDLE_ERROR( cudaEventCreate(&stop) );
+	HANDLE_ERROR( cudaEventRecord(start, 0) );    
+	//在设备上分配内存
+	HANDLE_ERROR( cudaMalloc( (void**)&dev_r, N * sizeof(float) ) );
+	HANDLE_ERROR( cudaMalloc( (void**)&dev_i, N * sizeof(float) ) );
+	
+
+	reverse(r);  //输入的自然序列的实部转换为倒叙
+	reverse(i);  //虚部
+
+ 	HANDLE_ERROR( cudaMemcpy(dev_r, r, N * sizeof(float), cudaMemcpyHostToDevice) );
+	HANDLE_ERROR( cudaMemcpy(dev_i, i, N * sizeof(float), cudaMemcpyHostToDevice) );
+
+	int f = N;
+	float *Wn_r, *Wn_i;
+
+	HANDLE_ERROR( cudaMalloc( (void**)&Wn_r, (N/2) * sizeof(float) ) );
+	HANDLE_ERROR( cudaMalloc( (void**)&Wn_i, (N/2) * sizeof(float) ) );
+
+	if(N/2<512)
+	 Wn_kernel<<<1,N/2>>>(Wn_r, Wn_i);
+	else
+		Wn_kernel<<<N/1024,512>>>(Wn_r, Wn_i);
+
+	HANDLE_ERROR( cudaBindTexture(NULL, W_r, Wn_r, N/2*sizeof(float) ) );
+	HANDLE_ERROR( cudaBindTexture(NULL, W_i, Wn_i, N/2*sizeof(float) ) );
+
+	int le, lei, l;
+	 for( l=1;(f=f/2)!=1;l++)   //计算整个运算的级数
+		 ;
+	
+	 for(int m=1;m<=l;m++)  {      //第m级运算
+		 le = 2<<(m-1); //蝶形距离
+		 lei=le/2;//进行蝶形运算两点的距离，事实上也等于每一级的不同旋转因子个
+		;
+		 
+		 for(int j=0;j<lei;j++) {
+
+		if( (N/le)<512 )	
+	     kernel<<<1,N/le>>>( dev_r, dev_i ,le,lei,j, m); //多少个相同的旋转因子开启多少个线程
+		else
+			kernel<<<N/(le*512),512>>>( dev_r, dev_i ,le,lei,j, m); //多少个相同的旋转因子开启多少个线程
+		
+		 }
+	 }
+	 //停止计时
+	 HANDLE_ERROR( cudaEventRecord(stop, 0) );
+	 HANDLE_ERROR( cudaEventSynchronize(stop) );
+	 HANDLE_ERROR( cudaEventSynchronize(stop) );
+	 float elapsedTime;
+	 HANDLE_ERROR( cudaEventElapsedTime(&elapsedTime,start,stop) );
+	 
+	
+	 HANDLE_ERROR( cudaMemcpy( out_r, dev_r, N * sizeof(float), cudaMemcpyDeviceToHost) );
+	 HANDLE_ERROR( cudaMemcpy( out_i, dev_i, N * sizeof(float), cudaMemcpyDeviceToHost) );
+	  for(int n=0; n<N; n++) {
+		printf("%f+%fi\n ",out_r[n],out_i[n]);
+	
+	} 
+	 printf( "time : %3.1fms\n",elapsedTime);
+	 HANDLE_ERROR( cudaEventDestroy(start) );
+	 HANDLE_ERROR( cudaEventDestroy(stop) );
+	 cudaFree(dev_r);
+	 cudaFree(dev_i);
+	 free(i);
+	 free(r);
+	 free(out_r);
+	 free(out_i);
+	 cudaUnbindTexture(W_r);
+	 cudaUnbindTexture(W_i);
+	 cudaProfilerStop();
+}
+
+
+
+	
